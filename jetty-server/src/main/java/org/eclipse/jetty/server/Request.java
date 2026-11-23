@@ -1315,7 +1315,13 @@ public class Request implements HttpServletRequest
     {
         final StringBuffer url = new StringBuffer(128);
         URIUtil.appendSchemeHostPort(url,getScheme(),getServerName(),getServerPort());
-        url.append(getRequestURI());
+        // only add RequestURI if not a CONNECT method
+        if (!HttpMethod.CONNECT.is(getMethod()))
+        {
+            String path = getRequestURI();
+            if (path != null)
+                url.append(path);
+        }
         return url;
     }
 
@@ -1758,17 +1764,22 @@ public class Request implements HttpServletRequest
         String info;
         if (path==null || path.length()==0)
         {
-            if (uri.isAbsolute())
+            if (HttpMethod.CONNECT.is(getMethod()))
+            {
+                path="/";
+                info=path;
+            }
+            else if (uri.isAbsolute())
             {
                 path="/";
                 uri.setPath(path);
+                info=path;
             }
             else
             {
                 setPathInfo("");
                 throw new BadMessageException(400,"Bad URI");
             }
-            info=path;
         }
         else if (!path.startsWith("/"))
         {
@@ -1780,7 +1791,17 @@ public class Request implements HttpServletRequest
             info=path;
         }
         else
+        {
+            // A relative path that only decodes to an absolute path (eg ";@host/path")
+            // must not be combined with an authority, as the resulting URI would be ambiguous.
+            String rawPath = uri.getPath();
+            if (rawPath == null || !rawPath.startsWith("/"))
+            {
+                setPathInfo(path);
+                throw new BadMessageException(400,"Bad URI");
+            }
             info = URIUtil.canonicalPath(path);// TODO should this be done prior to decoding???
+        }
 
         if (info == null)
         {

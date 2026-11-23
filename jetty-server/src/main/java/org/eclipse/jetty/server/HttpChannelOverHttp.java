@@ -40,6 +40,7 @@ import org.eclipse.jetty.http.HttpVersion;
 import org.eclipse.jetty.http.MetaData;
 import org.eclipse.jetty.io.Connection;
 import org.eclipse.jetty.io.EndPoint;
+import org.eclipse.jetty.util.HostPort;
 import org.eclipse.jetty.util.log.Log;
 import org.eclipse.jetty.util.log.Logger;
 
@@ -102,15 +103,105 @@ public class HttpChannelOverHttp extends HttpChannel implements HttpParser.Reque
     }
 
     @Override
-    public boolean startRequest(String method, String uri, HttpVersion version)
+    public boolean startRequest(String method, String requestTarget, HttpVersion version)
     {
         _metadata.setMethod(method);
-        _metadata.getURI().parseRequestTarget(method, uri);
+        _metadata.getURI().parseRequestTarget(method, requestTarget);
         _metadata.setHttpVersion(version);
         _unknownExpectation = false;
         _expect100Continue = false;
         _expect102Processing = false;
+
+        if (HttpMethod.CONNECT.is(method))
+        {
+            // The request-target of a CONNECT request must be in authority-form (RFC 7230 section 5.3.3)
+            // and is the only source of the authority, the Host header is ignored.
+            HostPort authority = parseAuthorityForm(requestTarget);
+            if (authority == null)
+                throw new BadMessageException(HttpStatus.BAD_REQUEST_400, "Bad CONNECT target");
+            _metadata.getURI().setAuthority(authority.getHost(), authority.getPort());
+        }
         return false;
+    }
+
+    /**
+     * Parse an authority-form request-target ({@code host:port}) as used by CONNECT.
+     *
+     * @param requestTarget the request-target
+     * @return the parsed host and port, or null if the request-target is not in authority-form
+     */
+    private static HostPort parseAuthorityForm(String requestTarget)
+    {
+        if (requestTarget == null || requestTarget.isEmpty())
+            return null;
+
+        for (int i = 0; i < requestTarget.length(); i++)
+        {
+            char c = requestTarget.charAt(i);
+            // no path, query, fragment or userinfo is allowed in authority-form
+            if (c <= ' ' || c >= 0x7F || c == '/' || c == '\\' || c == '?' || c == '#' || c == '@')
+                return null;
+        }
+
+        HostPort authority;
+        try
+        {
+            authority = new HostPort(requestTarget);
+        }
+        catch (IllegalArgumentException x)
+        {
+            return null;
+        }
+
+        String host = authority.getHost();
+        if (host == null || host.isEmpty())
+            return null;
+        if (host.charAt(0) == '[')
+        {
+            // IPv6 reference
+            if (host.length() < 3 || host.charAt(host.length() - 1) != ']')
+                return null;
+            for (int i = 1; i < host.length() - 1; i++)
+            {
+                char c = host.charAt(i);
+                if (!(c == ':' || c == '.' || Character.digit(c, 16) >= 0))
+                    return null;
+            }
+        }
+        else if (host.indexOf(':') >= 0 || host.indexOf('[') >= 0 || host.indexOf(']') >= 0)
+        {
+            return null;
+        }
+
+        // anything after the host must be a ':' followed by a decimal port
+        if (host.length() < requestTarget.length())
+        {
+            if (requestTarget.charAt(host.length()) != ':' || host.length() + 1 == requestTarget.length())
+                return null;
+            for (int i = host.length() + 1; i < requestTarget.length(); i++)
+            {
+                char c = requestTarget.charAt(i);
+                if (c < '0' || c > '9')
+                    return null;
+            }
+        }
+        return authority;
+    }
+
+    /**
+     * An authority may only be combined with an empty, {@code *} or absolute ({@code /} prefixed) path,
+     * otherwise the resulting URI would be ambiguous (eg {@code http://host;@other/path}).
+     *
+     * @param path the path of the request-target
+     * @return true if the path may be combined with an authority
+     */
+    private static boolean isPathValidForAuthority(String path)
+    {
+        if (path == null)
+            return true;
+        if (path.isEmpty() || "*".equals(path))
+            return true;
+        return path.startsWith("/");
     }
 
     @Override
@@ -127,7 +218,10 @@ public class HttpChannelOverHttp extends HttpChannel implements HttpParser.Reque
                     break;
 
                 case HOST:
-                    if (!_metadata.getURI().isAbsolute() && field instanceof HostPortHttpField)
+                    if (!HttpMethod.CONNECT.is(_metadata.getMethod()) &&
+                        !_metadata.getURI().isAbsolute() &&
+                        isPathValidForAuthority(_metadata.getURI().getPath()) &&
+                        field instanceof HostPortHttpField)
                     {
                         HostPortHttpField hp = (HostPortHttpField)field;
                         _metadata.getURI().setAuthority(hp.getHost(), hp.getPort());
