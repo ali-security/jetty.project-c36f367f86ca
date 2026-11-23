@@ -1,0 +1,212 @@
+# Sealed-libraries build for org.eclipse.jetty:jetty-server 9.3.24.v20180605.
+# jetty.project 9.3.x has no GitHub Actions CI (only a Jenkinsfile: jdk8 + maven3,
+# `mvn -B clean install`), so this workflow mirrors that Jenkins build on a GitHub runner.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional surefire -Dtest selector; empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      MAVEN_OPTS: "-Xms256m -Xmx2g -Djava.awt.headless=true -Dhttps.protocols=TLSv1.2 -Dstyle.color=never"
+      # The CVE patches for this coordinate touch jetty-util/http/server/servlet/servlets/client/proxy,
+      # http2-client (PushCacheFilterTest), the server session code and tests/test-http-client-transport
+      # (HttpClientLoadTest), so their suites all run here.
+      MODULES: "jetty-server,jetty-servlet,jetty-servlets,jetty-client,jetty-proxy,jetty-http2/http2-client,jetty-http2/http2-http-client-transport,tests/test-http-client-transport,tests/test-sessions/test-hash-sessions"
+      # Lint / static-analysis / doc gates: not tests, never execute the code.
+      GATE_SKIPS: "-Dmaven.javadoc.skip=true -Dmaven.source.skip=true -Dcheckstyle.skip=true -Dpmd.skip=true -Dfindbugs.skip=true -Denforcer.skip=true -Dlicense.skip=true -Dgpg.skip=true"
+    steps:
+      - uses: actions/checkout@v4
+
+      # Provides an up-to-date cacerts for the old JDK below.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+
+      # The root pom activates alpn.version only for exact java.version values; 1.8.0_172 maps to
+      # alpn-boot 8.1.12.v20180117, which http2-http-client-transport and test-http-client-transport put
+      # on -Xbootclasspath/p. A current 8u leaves alpn.version=undefined, so pin Zulu 8u172 (the JDK
+      # contemporary with this release).
+      - name: Install Zulu JDK 8u172
+        run: |
+          set -euo pipefail
+          CACERTS="$JAVA_HOME/jre/lib/security/cacerts"
+          mkdir -p "$RUNNER_TEMP/zulu8"
+          curl -fsSL https://cdn.azul.com/zulu/bin/zulu8.30.0.1-ca-jdk8.0.172-linux_x64.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP/zulu8" --strip-components=1
+          cp "$CACERTS" "$RUNNER_TEMP/zulu8/jre/lib/security/cacerts"
+          echo "JAVA_HOME=$RUNNER_TEMP/zulu8" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/zulu8/bin" >> "$GITHUB_PATH"
+
+      - name: Install Maven 3.9.4
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/maven"
+          curl -fsSL https://archive.apache.org/dist/maven/maven-3/3.9.4/binaries/apache-maven-3.9.4-bin.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP/maven" --strip-components=1
+          echo "$RUNNER_TEMP/maven/bin" >> "$GITHUB_PATH"
+
+      - name: Toolchain
+        run: |
+          java -version
+          mvn -v
+
+      - name: Build and test
+        run: |
+          set -o pipefail
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            mvn -B -V -e clean install -pl "$MODULES" -am $GATE_SKIPS \
+              -Dsurefire.timeout=1200 \
+              -Dtest='${{ inputs.test-filter }}' -DfailIfNoTests=false 2>&1 | tee "$RUNNER_TEMP/mvn.log"
+          else
+            mvn -B -V -e clean install -pl "$MODULES" -am $GATE_SKIPS \
+              -Dsurefire.timeout=1200 -Dsurefire.rerunFailingTestsCount=2 2>&1 | tee "$RUNNER_TEMP/mvn.log"
+          fi
+
+      - name: Test summary (per-module totals and every skipped test with its reason)
+        if: always()
+        shell: python
+        run: |
+          import glob, os, re
+          import xml.etree.ElementTree as ET
+          log = os.path.join(os.environ["RUNNER_TEMP"], "mvn.log")
+          # surefire 2.19.1 prints its per-module "Results :" summary line with no log-level prefix
+          pat = re.compile(r"^(?:\[(?:INFO|WARNING|ERROR)\] )?Tests run: (\d+), Failures: (\d+), Errors: (\d+), Skipped: (\d+)(?:, Flakes: (\d+))?\s*$")
+          mod = re.compile(r"^\[INFO\] Building (.+?) 9\.3\.24")
+          cur = "?"
+          tot = [0, 0, 0, 0, 0]
+          print("=== Per-module surefire results ===")
+          if os.path.exists(log):
+              for line in open(log, encoding="utf-8", errors="replace"):
+                  m = mod.match(line)
+                  if m:
+                      cur = m.group(1).strip()
+                  m = pat.match(line.rstrip("\n"))
+                  if m:
+                      vals = [int(m.group(i) or 0) for i in range(1, 6)]
+                      tot = [a + b for a, b in zip(tot, vals)]
+                      print(f"{cur}: run={vals[0]} failures={vals[1]} errors={vals[2]} skipped={vals[3]} flakes={vals[4]}")
+
+          import functools
+
+          @functools.lru_cache(maxsize=None)
+          def find_sources(name):
+              rel = name.replace(".", "/").split("$")[0] + ".java"
+              hits = glob.glob("**/src/*/java/" + rel, recursive=True)
+              if not hits and "/" not in rel:
+                  hits = glob.glob("**/src/*/java/**/" + rel, recursive=True)
+              return tuple(hits)
+
+          @functools.lru_cache(maxsize=None)
+          def read(src):
+              return open(src, encoding="utf-8", errors="replace").read()
+
+          def class_reason(text, param):
+              ci = re.search(r'@Ignore(?:\s*\(\s*"([^"]*)"\s*\))?\s*(?:@\w+(?:\([^)]*\))?\s*)*public\s+(?:abstract\s+)?class', text)
+              if ci:
+                  return "class-level @Ignore" + (": " + ci.group(1) if ci.group(1) else "")
+              for cn in re.finditer(r"super\(\s*transport\s*==\s*Transport\.(\w+)\s*\?\s*null", text):
+                  if param and cn.group(1) in param:
+                      return ("constructor passes a null transport for " + cn.group(1) +
+                              ", so AbstractTest's Assume.assumeNotNull(transport) skips this variant (upstream does not run this class over " + cn.group(1) + ")")
+              return None
+
+          def method_reason(text, method, depth=0):
+              m = re.search(r"\bvoid\s+" + re.escape(method) + r"\s*\(", text)
+              if not m:
+                  return None
+              idx = m.start()
+              head = text[max(text.rfind("}", 0, idx), text.rfind(";", 0, idx), 0):idx]
+              found = re.findall(r'@Ignore\s*\(\s*"([^"]*)"\s*\)', head)
+              if found:
+                  return "@Ignore(\"" + found[-1] + "\")"
+              for rx in (r"(@Ignore)\b", r"(@Stress\([^)]*\))", r"(@Slow)\b"):
+                  found = re.findall(rx, head)
+                  if found:
+                      return found[-1] + " annotation in upstream source"
+              nxt = text.find("@Test", idx)
+              body = text[idx:nxt if nxt > 0 else idx + 3000]
+              found = re.findall(r"((?:Assume\.)?assume\w*\([^;]*\));", body)
+              if found:
+                  return "assumption not met for this variant: " + " ".join(found[0].split())
+              if depth == 0:
+                  # the assumption may sit in a private helper the test delegates to
+                  for helper in dict.fromkeys(re.findall(r"\b([a-z]\w*)\s*\(", body[m.end() - idx:])):
+                      if helper == method:
+                          continue
+                      hr = method_reason(text, helper, 1)
+                      if hr and hr.startswith("assumption"):
+                          return hr + " (in helper " + helper + "())"
+              return ""
+
+          def reason_from_source(cls, name):
+              method = re.sub(r"\[.*$", "", name)
+              pm = re.search(r"\[(.*)\]$", name)
+              param = pm.group(1) if pm else ""
+              queue, seen = [cls], set()
+              while queue:
+                  c = queue.pop(0)
+                  for src in find_sources(c):
+                      if src in seen:
+                          continue
+                      seen.add(src)
+                      text = read(src)
+                      cr = class_reason(text, param)
+                      if cr:
+                          return cr
+                      mr = method_reason(text, method)
+                      if mr:
+                          return mr
+                      ext = re.search(r"class\s+\w+(?:<[^>]*>)?\s+extends\s+([\w.]+)", text)
+                      if ext:
+                          queue.append(ext.group(1))
+              return "no @Ignore/Assume found in source; surefire gave no message"
+
+          print("=== Skipped tests (name and reason) ===")
+          nskip = 0
+          for f in sorted(glob.glob("**/target/surefire-reports/TEST-*.xml", recursive=True)):
+              try:
+                  root = ET.parse(f).getroot()
+              except Exception as e:
+                  print(f"unparseable {f}: {e}")
+                  continue
+              for tc in root.iter("testcase"):
+                  sk = tc.find("skipped")
+                  if sk is None:
+                      continue
+                  nskip += 1
+                  cls = tc.get("classname") or root.get("name") or "?"
+                  name = tc.get("name") or ""
+                  msg = " ".join((sk.get("message") or "").split())
+                  why = reason_from_source(cls, name)
+                  print(f"SKIPPED {cls}#{name}: {why}" + (f" [surefire: {msg}]" if msg else ""))
+          print(f"(skipped testcases listed: {nskip})")
+          run, fail, err, skip, flakes = tot
+          print("=== TOTAL ===")
+          print(f"TOTAL tests run: {run}, failures: {fail}, errors: {err}, skipped: {skip}, flakes (passed on rerun): {flakes}")
+          print(f"TOTAL tests passed: {run - fail - err - skip}")
+
+      - name: Stage release jars
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          V=9.3.24.v20180605
+          for j in jetty-server-$V.jar jetty-server-$V-config.jar jetty-server-$V-tests.jar; do
+            cp "jetty-server/target/$j" "$RUNNER_TEMP/out/"
+          done
+          ls -l "$RUNNER_TEMP/out"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jetty-server-jars
+          path: ${{ runner.temp }}/out/*.jar
+          if-no-files-found: error
