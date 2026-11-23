@@ -20,6 +20,7 @@ package org.eclipse.jetty.server.handler;
 
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.endsWith;
+import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.startsWith;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThat;
@@ -28,12 +29,16 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.MalformedURLException;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+
+import javax.servlet.http.HttpServletRequest;
 
 import org.eclipse.jetty.http.HttpTester;
 import org.eclipse.jetty.server.Connector;
@@ -42,10 +47,14 @@ import org.eclipse.jetty.server.HttpConnectionFactory;
 import org.eclipse.jetty.server.LocalConnector;
 import org.eclipse.jetty.server.Server;
 import org.eclipse.jetty.server.ServerConnector;
+import org.eclipse.jetty.toolchain.test.FS;
 import org.eclipse.jetty.toolchain.test.MavenTestingUtils;
 import org.eclipse.jetty.toolchain.test.annotation.Slow;
 import org.eclipse.jetty.util.BufferUtil;
 import org.eclipse.jetty.util.IO;
+import org.eclipse.jetty.util.URIUtil;
+import org.eclipse.jetty.util.resource.PathResource;
+import org.eclipse.jetty.util.resource.Resource;
 import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.Before;
@@ -265,6 +274,123 @@ public class ResourceHandlerTest
             assertEquals('N',buffer.get(buffer.limit()-3));
             assertEquals('D',buffer.get(buffer.limit()-2));
             
+        }
+    }
+
+    /**
+     * Raw (non-encoded) request URIs that try to break out of the
+     * Parent Directory href attribute of a directory listing.
+     */
+    private static final String[] LISTING_XSS_URIS =
+    {
+        "/listing/one/;\"onmouseover='alert(document.location)'",
+        "/listing/one/;\"><script>alert(document.domain)<%2Fscript>"
+    };
+
+    private static File createListingDocroot() throws IOException
+    {
+        File docroot = MavenTestingUtils.getTargetTestingDir("ResourceHandlerTest-listingXSS");
+        FS.ensureEmpty(docroot);
+        FS.ensureDirExists(new File(docroot,"one"));
+        FS.touch(new File(new File(docroot,"one"),"file.txt"));
+        return docroot;
+    }
+
+    private static HttpTester.Response getListing(ResourceHandler handler, File docroot, String uri) throws Exception
+    {
+        Server server = new Server();
+        LocalConnector local = new LocalConnector(server);
+        server.setConnectors(new Connector[] { local });
+
+        handler.setDirectoriesListed(true);
+        handler.setResourceBase(docroot.getAbsolutePath());
+
+        ContextHandler context = new ContextHandler("/listing");
+        context.setHandler(handler);
+        server.setHandler(context);
+        server.start();
+        try
+        {
+            return HttpTester.parseResponse(local.getResponse("GET " + uri + " HTTP/1.0\r\n\r\n"));
+        }
+        finally
+        {
+            server.stop();
+        }
+    }
+
+    private static void assertListingNotInjected(HttpTester.Response response)
+    {
+        assertEquals(200,response.getStatus());
+        String content = response.getContent();
+        assertThat(content,containsString("Parent Directory"));
+        assertThat(content,not(containsString("\"onmouseover")));
+        assertThat(content,not(containsString("<script>")));
+        assertThat(content,not(containsString("\"><")));
+    }
+
+    /**
+     * CVE-2019-10241: the Parent Directory link of a directory listing must not
+     * reflect the raw request URI into the href attribute.
+     */
+    @Test
+    public void testListingXSS() throws Exception
+    {
+        File docroot = createListingDocroot();
+        for (String uri : LISTING_XSS_URIS)
+        {
+            HttpTester.Response response = getListing(new ResourceHandler(),docroot,uri);
+            assertListingNotInjected(response);
+            assertThat(response.getContent(),containsString("file.txt"));
+        }
+    }
+
+    /**
+     * CVE-2019-10241: the ResourceHandler must hand an attribute-safe base URI to
+     * {@link Resource#getListHTML(String, boolean)}, so the listing is safe even
+     * when the Resource implementation renders the Parent Directory link from
+     * the base URI as given (as unpatched jetty-util versions do).
+     */
+    @Test
+    public void testListingXSSWithUnencodedParentLink() throws Exception
+    {
+        File docroot = createListingDocroot();
+        for (String uri : LISTING_XSS_URIS)
+        {
+            ResourceHandler handler = new ResourceHandler()
+            {
+                @Override
+                protected Resource getResource(HttpServletRequest request) throws MalformedURLException
+                {
+                    Resource resource = super.getResource(request);
+                    if (!(resource instanceof PathResource) || !resource.isDirectory())
+                        return resource;
+
+                    return new PathResource(((PathResource)resource).getPath())
+                    {
+                        @Override
+                        public String getListHTML(String base, boolean parent, String query) throws IOException
+                        {
+                            base = URIUtil.canonicalPath(base);
+                            StringBuilder buf = new StringBuilder();
+                            buf.append("<HTML><HEAD><TITLE>Unencoded Listing</TITLE></HEAD><BODY>\n");
+                            if (parent)
+                            {
+                                buf.append("<A HREF=\"");
+                                buf.append(URIUtil.addEncodedPaths(base,"../"));
+                                buf.append("\">Parent Directory</A>\n");
+                            }
+                            buf.append("</BODY></HTML>\n");
+                            return buf.toString();
+                        }
+                    };
+                }
+            };
+
+            HttpTester.Response response = getListing(handler,docroot,uri);
+            assertListingNotInjected(response);
+            assertThat(response.getContent(),containsString("Unencoded Listing"));
+            assertThat(response.getContent(),containsString("%22"));
         }
     }
 }

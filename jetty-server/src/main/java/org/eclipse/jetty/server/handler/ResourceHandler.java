@@ -592,12 +592,71 @@ public class ResourceHandler extends HandlerWrapper implements ResourceFactory
     {
         if (_directory)
         {
-            String listing = resource.getListHTML(request.getRequestURI(),request.getPathInfo().lastIndexOf("/") > 0);
+            String listing = resource.getListHTML(hrefEncodeURI(request.getRequestURI()),request.getPathInfo().lastIndexOf("/") > 0);
             response.setContentType("text/html;charset=utf-8");
             response.getWriter().println(listing);
         }
         else
             response.sendError(HttpStatus.FORBIDDEN_403);
+    }
+
+    /* ------------------------------------------------------------ */
+    /**
+     * Encode the characters of a raw request URI that would allow it to break
+     * out of an HTML attribute value (such as the hrefs of a directory listing).
+     * <p>
+     * Only the <code>"</code>, <code>'</code>, <code>&lt;</code> and <code>&gt;</code>
+     * characters are percent-encoded; already encoded sequences and path parameters
+     * are left as is, so the URI still references the same resource.
+     *
+     * @param raw the raw request URI
+     * @return the URI safe for use within an HTML attribute value
+     * @see <a href="https://nvd.nist.gov/vuln/detail/CVE-2019-10241">CVE-2019-10241</a>
+     */
+    private static String hrefEncodeURI(String raw)
+    {
+        if (raw==null)
+            return null;
+
+        StringBuilder buf = null;
+        for (int i=0;i<raw.length();i++)
+        {
+            char c=raw.charAt(i);
+            String encoded;
+            switch(c)
+            {
+                case '"':
+                    encoded="%22";
+                    break;
+                case '\'':
+                    encoded="%27";
+                    break;
+                case '<':
+                    encoded="%3C";
+                    break;
+                case '>':
+                    encoded="%3E";
+                    break;
+                default:
+                    encoded=null;
+                    break;
+            }
+
+            if (encoded==null)
+            {
+                if (buf!=null)
+                    buf.append(c);
+                continue;
+            }
+
+            if (buf==null)
+            {
+                buf=new StringBuilder(raw.length()<<1);
+                buf.append(raw,0,i);
+            }
+            buf.append(encoded);
+        }
+        return buf==null?raw:buf.toString();
     }
 
     /* ------------------------------------------------------------ */

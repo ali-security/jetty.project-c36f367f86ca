@@ -579,14 +579,14 @@ public abstract class Resource implements ResourceFactory, Closeable
         buf.append(title);
         buf.append("</H1>\n<TABLE BORDER=0>\n");
 
+        String encodedBase = hrefEncodeURI(base);
+
         if (parent)
         {
             buf.append("<TR><TD><A HREF=\"");
-            buf.append(URIUtil.addEncodedPaths(base,"../"));
+            buf.append(URIUtil.addEncodedPaths(encodedBase,"../"));
             buf.append("\">Parent Directory</A></TD><TD></TD><TD></TD></TR>\n");
         }
-
-        String encodedBase = hrefEncodeURI(base);
 
         DateFormat dfmt=DateFormat.getDateTimeInstance(DateFormat.MEDIUM,
                                                        DateFormat.MEDIUM);

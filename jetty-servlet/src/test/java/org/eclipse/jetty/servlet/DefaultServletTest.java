@@ -157,9 +157,14 @@ public class DefaultServletTest
         /* create some content in the docroot */
         File resBase = testdir.getPathFile("docroot").toFile();
         FS.ensureDirExists(resBase);
-        assertTrue(new File(resBase, "one").mkdir());
+        File one = new File(resBase, "one");
+        assertTrue(one.mkdir());
         assertTrue(new File(resBase, "two").mkdir());
         assertTrue(new File(resBase, "three").mkdir());
+
+        File alert = new File(one, "onmouseclick='alert(oops)'");
+        FS.touch(alert);
+
         if (!OS.IS_WINDOWS)
         {
             assertTrue("Creating dir 'f??r' (Might not work in Windows)", new File(resBase, "f??r").mkdir());
@@ -179,6 +184,17 @@ public class DefaultServletTest
         String response = connector.getResponses(req1.toString());
 
         assertResponseNotContains("<script>", response);
+
+
+        req1 = new StringBuffer();
+        req1.append("GET /context/one/;\"onmouseover='alert(document.location)' HTTP/1.0\n");
+        req1.append("\n");
+
+        response = connector.getResponses(req1.toString());
+
+        assertResponseContains("200 OK", response);
+        assertResponseContains("Parent Directory", response);
+        assertResponseNotContains("\"onmouseover", response);
     }
 
     /**
