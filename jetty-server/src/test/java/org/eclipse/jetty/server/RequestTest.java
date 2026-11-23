@@ -42,6 +42,7 @@ import java.io.UnsupportedEncodingException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Enumeration;
 import java.util.Locale;
 import java.util.Map;
@@ -430,6 +431,224 @@ public class RequestTest
             //System.err.println(responses);
             assertTrue(responses.startsWith("HTTP/1.1 500"));
         }
+    }
+
+    @Test
+    public void testMultiPartFormKeysLimitFromServerAttribute() throws Exception
+    {
+        _server.setAttribute("org.eclipse.jetty.server.Request.maxFormKeys",3);
+        AtomicInteger numParts = new AtomicInteger(-1);
+        AtomicReference<String> failure = new AtomicReference<>();
+        checkMultiPartParts(numParts, failure);
+
+        String responses = sendMultiPart("/", multiPartContent(3, "value"));
+        assertThat(responses, startsWith("HTTP/1.1 200"));
+        assertThat(numParts.get(), is(3));
+        assertNull(failure.get());
+
+        numParts.set(-1);
+        responses = sendMultiPart("/", multiPartContent(4, "value"));
+        assertThat(responses, startsWith("HTTP/1.1 500"));
+        assertThat(failure.get(), containsString("Form with too many parts [4 > 3]"));
+        assertThat(numParts.get(), is(-1));
+    }
+
+    @Test
+    public void testMultiPartFormKeysLimitFromContext() throws Exception
+    {
+        ContextHandler contextHandler = new ContextHandler("/foo");
+        contextHandler.setMaxFormKeys(2);
+        _server.stop();
+        contextHandler.setHandler(_handler);
+        _server.setHandler(contextHandler);
+        _server.start();
+
+        AtomicInteger numParts = new AtomicInteger(-1);
+        AtomicReference<String> failure = new AtomicReference<>();
+        checkMultiPartParts(numParts, failure);
+
+        String responses = sendMultiPart("/foo/x", multiPartContent(2, "value"));
+        assertThat(responses, startsWith("HTTP/1.1 200"));
+        assertThat(numParts.get(), is(2));
+        assertNull(failure.get());
+
+        numParts.set(-1);
+        responses = sendMultiPart("/foo/x", multiPartContent(3, "value"));
+        assertThat(responses, startsWith("HTTP/1.1 500"));
+        assertThat(failure.get(), containsString("Form with too many parts [3 > 2]"));
+        assertThat(numParts.get(), is(-1));
+    }
+
+    @Test
+    public void testMultiPartFormKeysLimitWithEncodedBoundaries() throws Exception
+    {
+        // Boundaries hidden in base64 encoded part content are not visible in the raw
+        // request content, but they still delimit parts and must count towards the limit.
+        String encodedBoundary = Base64.getEncoder().encodeToString("--AaB03x\r\n".getBytes(StandardCharsets.ISO_8859_1));
+        StringBuilder multipart = new StringBuilder("--AaB03x\r\n");
+        for (int i = 0; i < 4; i++)
+        {
+            multipart.append("content-disposition: form-data; name=\"field").append(i).append("\"\r\n")
+                .append("content-transfer-encoding: base64\r\n")
+                .append("\r\n")
+                .append(encodedBoundary).append("\r\n");
+        }
+        multipart.append("content-disposition: form-data; name=\"last\"\r\n")
+            .append("\r\n")
+            .append("value\r\n")
+            .append("--AaB03x--\r\n");
+
+        AtomicInteger numParts = new AtomicInteger(-1);
+        AtomicReference<String> failure = new AtomicReference<>();
+        checkMultiPartParts(numParts, failure);
+
+        // Without a configured limit the default of 1000 applies, so all the parts are parsed.
+        String responses = sendMultiPart("/", multipart.toString());
+        assertThat(responses, startsWith("HTTP/1.1 200"));
+        assertThat(numParts.get(), is(5));
+        assertNull(failure.get());
+
+        _server.setAttribute("org.eclipse.jetty.server.Request.maxFormKeys",3);
+        numParts.set(-1);
+        responses = sendMultiPart("/", multipart.toString());
+        assertThat(responses, startsWith("HTTP/1.1 500"));
+        assertThat(failure.get(), containsString("Form with too many parts [4 > 3]"));
+        assertThat(numParts.get(), is(-1));
+    }
+
+    @Test
+    public void testMultiPartFormDefaultLimits() throws Exception
+    {
+        // Neither the context nor the server configure any limit, so the defaults apply.
+        ContextHandler contextHandler = new ContextHandler("/foo");
+        _server.stop();
+        contextHandler.setHandler(_handler);
+        _server.setHandler(contextHandler);
+        _server.start();
+
+        AtomicInteger numParts = new AtomicInteger(-1);
+        AtomicReference<String> failure = new AtomicReference<>();
+        checkMultiPartParts(numParts, failure);
+
+        String responses = sendMultiPart("/foo/x", multiPartContent(1000, "value"));
+        assertThat(responses, startsWith("HTTP/1.1 200"));
+        assertThat(numParts.get(), is(1000));
+        assertNull(failure.get());
+
+        numParts.set(-1);
+        responses = sendMultiPart("/foo/x", multiPartContent(1001, "value"));
+        assertThat(responses, startsWith("HTTP/1.1 500"));
+        assertThat(failure.get(), containsString("Form with too many parts [1001 > 1000]"));
+        assertThat(numParts.get(), is(-1));
+
+        failure.set(null);
+        responses = sendMultiPart("/foo/x", multiPartContent(1, repeat('x', 200000)));
+        assertThat(responses, startsWith("HTTP/1.1 200"));
+        assertThat(numParts.get(), is(1));
+        assertNull(failure.get());
+
+        numParts.set(-1);
+        responses = sendMultiPart("/foo/x", multiPartContent(1, repeat('x', 200001)));
+        assertThat(responses, startsWith("HTTP/1.1 500"));
+        assertThat(failure.get(), containsString("Form is larger than max length 200000"));
+        assertThat(numParts.get(), is(-1));
+    }
+
+    @Test
+    public void testMultiPartFormContentSizeLimit() throws Exception
+    {
+        ContextHandler contextHandler = new ContextHandler("/foo");
+        contextHandler.setMaxFormContentSize(1000);
+        _server.stop();
+        contextHandler.setHandler(_handler);
+        _server.setHandler(contextHandler);
+        _server.start();
+
+        AtomicInteger numParts = new AtomicInteger(-1);
+        AtomicReference<String> failure = new AtomicReference<>();
+        checkMultiPartParts(numParts, failure);
+
+        // Parts with a filename are not form content, so they are not limited.
+        String multipart = "--AaB03x\r\n"+
+            "content-disposition: form-data; name=\"stuff\"; filename=\"foo.upload\"\r\n"+
+            "\r\n"+
+            repeat('0', 2000)+"\r\n"+
+            "--AaB03x--\r\n";
+        String responses = sendMultiPart("/foo/x", multipart);
+        assertThat(responses, startsWith("HTTP/1.1 200"));
+        assertThat(numParts.get(), is(1));
+        assertNull(failure.get());
+
+        // A single large part without a filename.
+        numParts.set(-1);
+        responses = sendMultiPart("/foo/x", multiPartContent(1, repeat('x', 1001)));
+        assertThat(responses, startsWith("HTTP/1.1 500"));
+        assertThat(failure.get(), containsString("Form is larger than max length 1000"));
+        assertThat(numParts.get(), is(-1));
+
+        // Several parts without a filename that together are too large.
+        failure.set(null);
+        responses = sendMultiPart("/foo/x", multiPartContent(3, repeat('x', 400)));
+        assertThat(responses, startsWith("HTTP/1.1 500"));
+        assertThat(failure.get(), containsString("Form is larger than max length 1000"));
+        assertThat(numParts.get(), is(-1));
+    }
+
+    private void checkMultiPartParts(AtomicInteger numParts, AtomicReference<String> failure)
+    {
+        final File tmpDir = MavenTestingUtils.getTargetTestingDir("multipart-limits");
+        FS.ensureEmpty(tmpDir);
+        _handler._checker = (request, response) ->
+        {
+            request.setAttribute(Request.__MULTIPART_CONFIG_ELEMENT, new MultipartConfigElement(tmpDir.getAbsolutePath()));
+            try
+            {
+                numParts.set(request.getParts().size());
+                return true;
+            }
+            catch (IllegalStateException e)
+            {
+                failure.set(e.getMessage());
+                return false;
+            }
+            catch (ServletException e)
+            {
+                throw new IOException(e);
+            }
+        };
+    }
+
+    private String sendMultiPart(String uri, String multipart) throws Exception
+    {
+        String request="POST "+uri+" HTTP/1.1\r\n"+
+            "Host: whatever\r\n"+
+            "Content-Type: multipart/form-data; boundary=\"AaB03x\"\r\n"+
+            "Content-Length: "+multipart.getBytes(StandardCharsets.ISO_8859_1).length+"\r\n"+
+            "Connection: close\r\n"+
+            "\r\n"+
+            multipart;
+        return _connector.getResponses(request);
+    }
+
+    private static String multiPartContent(int numParts, String value)
+    {
+        StringBuilder multipart = new StringBuilder();
+        for (int i = 0; i < numParts; i++)
+        {
+            multipart.append("--AaB03x\r\n")
+                .append("content-disposition: form-data; name=\"field").append(i).append("\"\r\n")
+                .append("\r\n")
+                .append(value).append("\r\n");
+        }
+        multipart.append("--AaB03x--\r\n");
+        return multipart.toString();
+    }
+
+    private static String repeat(char c, int count)
+    {
+        char[] chars = new char[count];
+        Arrays.fill(chars, c);
+        return new String(chars);
     }
 
 

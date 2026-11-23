@@ -468,46 +468,8 @@ public class Request implements HttpServletRequest
     {
         try
         {
-            int maxFormContentSize = -1;
-            int maxFormKeys = -1;
-
-            if (_context != null)
-            {
-                maxFormContentSize = _context.getContextHandler().getMaxFormContentSize();
-                maxFormKeys = _context.getContextHandler().getMaxFormKeys();
-            }
-
-            if (maxFormContentSize < 0)
-            {
-                Object obj = _channel.getServer().getAttribute("org.eclipse.jetty.server.Request.maxFormContentSize");
-                if (obj == null)
-                    maxFormContentSize = 200000;
-                else if (obj instanceof Number)
-                {
-                    Number size = (Number)obj;
-                    maxFormContentSize = size.intValue();
-                }
-                else if (obj instanceof String)
-                {
-                    maxFormContentSize = Integer.valueOf((String)obj);
-                }
-            }
-
-            if (maxFormKeys < 0)
-            {
-                Object obj = _channel.getServer().getAttribute("org.eclipse.jetty.server.Request.maxFormKeys");
-                if (obj == null)
-                    maxFormKeys = 1000;
-                else if (obj instanceof Number)
-                {
-                    Number keys = (Number)obj;
-                    maxFormKeys = keys.intValue();
-                }
-                else if (obj instanceof String)
-                {
-                    maxFormKeys = Integer.valueOf((String)obj);
-                }
-            }
+            int maxFormContentSize = lookupMaxFormContentSize();
+            int maxFormKeys = lookupMaxFormKeys();
 
             int contentLength = getContentLength();
             if (contentLength > maxFormContentSize && maxFormContentSize > 0)
@@ -527,6 +489,77 @@ public class Request implements HttpServletRequest
             else
                 LOG.warn(e.toString());
         }
+    }
+
+    /* ------------------------------------------------------------ */
+    /**
+     * @return the maximum form content size from the context, or if there is no context (or it
+     * is not configured) the "org.eclipse.jetty.server.Request.maxFormContentSize" {@link Server}
+     * attribute, or the default of 200000.
+     */
+    private int lookupMaxFormContentSize()
+    {
+        int maxFormContentSize = -1;
+
+        if (_context != null)
+            maxFormContentSize = _context.getContextHandler().getMaxFormContentSize();
+
+        if (maxFormContentSize < 0)
+        {
+            Object obj = getServerAttribute("org.eclipse.jetty.server.Request.maxFormContentSize");
+            if (obj == null)
+                maxFormContentSize = 200000;
+            else if (obj instanceof Number)
+            {
+                Number size = (Number)obj;
+                maxFormContentSize = size.intValue();
+            }
+            else if (obj instanceof String)
+            {
+                maxFormContentSize = Integer.valueOf((String)obj);
+            }
+        }
+
+        return maxFormContentSize;
+    }
+
+    /* ------------------------------------------------------------ */
+    /**
+     * @return the maximum number of form keys from the context, or if there is no context (or it
+     * is not configured) the "org.eclipse.jetty.server.Request.maxFormKeys" {@link Server}
+     * attribute, or the default of 1000.
+     */
+    private int lookupMaxFormKeys()
+    {
+        int maxFormKeys = -1;
+
+        if (_context != null)
+            maxFormKeys = _context.getContextHandler().getMaxFormKeys();
+
+        if (maxFormKeys < 0)
+        {
+            Object obj = getServerAttribute("org.eclipse.jetty.server.Request.maxFormKeys");
+            if (obj == null)
+                maxFormKeys = 1000;
+            else if (obj instanceof Number)
+            {
+                Number keys = (Number)obj;
+                maxFormKeys = keys.intValue();
+            }
+            else if (obj instanceof String)
+            {
+                maxFormKeys = Integer.valueOf((String)obj);
+            }
+        }
+
+        return maxFormKeys;
+    }
+
+    /* ------------------------------------------------------------ */
+    private Object getServerAttribute(String name)
+    {
+        Server server = _channel == null ? null : _channel.getServer();
+        return server == null ? null : server.getAttribute(name);
     }
 
     /* ------------------------------------------------------------ */
@@ -2347,19 +2380,28 @@ public class Request implements HttpServletRequest
             if (config == null)
                 throw new IllegalStateException("No multipart config for servlet");
 
-            _multiPartInputStream = new MultiPartInputStreamParser(getInputStream(),
+            int maxFormContentSize = lookupMaxFormContentSize();
+            int maxFormKeys = lookupMaxFormKeys();
+
+            _multiPartInputStream = new LimitedMultiPartInputStreamParser(getInputStream(),
                                                              getContentType(), config,
-                                                             (_context != null?(File)_context.getAttribute("javax.servlet.context.tempdir"):null));
+                                                             (_context != null?(File)_context.getAttribute("javax.servlet.context.tempdir"):null),
+                                                             maxFormKeys);
 
             setAttribute(__MULTIPART_INPUT_STREAM, _multiPartInputStream);
             setAttribute(__MULTIPART_CONTEXT, _context);
             Collection<Part> parts = _multiPartInputStream.getParts(); //causes parsing
+            long formContentSize = 0;
             ByteArrayOutputStream os = null;
             for (Part p:parts)
             {
                 MultiPartInputStreamParser.MultiPart mp = (MultiPartInputStreamParser.MultiPart)p;
                 if (mp.getContentDispositionFilename() == null)
                 {
+                    formContentSize = Math.addExact(formContentSize, p.getSize());
+                    if (maxFormContentSize >= 0 && formContentSize > maxFormContentSize)
+                        throw new IllegalStateException("Form is larger than max length " + maxFormContentSize);
+
                     // Servlet Spec 3.0 pg 23, parts without filename must be put into params.
                     String charset = null;
                     if (mp.getContentType() != null)
@@ -2481,5 +2523,70 @@ public class Request implements HttpServletRequest
     public <T extends HttpUpgradeHandler> T upgrade(Class<T> handlerClass) throws IOException, ServletException
     {
         throw new ServletException("HttpServletRequest.upgrade() not supported in Jetty");
+    }
+
+    /* ------------------------------------------------------------ */
+    /**
+     * A {@link MultiPartInputStreamParser} that limits the number of parts that can be
+     * parsed from the multipart content (see CVE-2023-26048).
+     */
+    private static class LimitedMultiPartInputStreamParser extends MultiPartInputStreamParser
+    {
+        private final int _maxParts;
+        private int _numParts;
+        private boolean _parsing;
+
+        /**
+         * @param in Request input stream
+         * @param contentType Content-Type header
+         * @param config MultipartConfigElement
+         * @param contextTmpDir javax.servlet.context.tempdir
+         * @param maxParts the maximum number of parts that can be parsed from the multipart content (0 for no parts allowed, -1 for unlimited parts).
+         */
+        LimitedMultiPartInputStreamParser(InputStream in, String contentType, MultipartConfigElement config, File contextTmpDir, int maxParts)
+        {
+            super(in, contentType, config, contextTmpDir);
+            _maxParts = maxParts;
+        }
+
+        @Override
+        protected void parse()
+        {
+            //have we already parsed the input?
+            if (_parts != null || _err != null)
+                return;
+
+            _parsing = true;
+            try
+            {
+                super.parse();
+            }
+            finally
+            {
+                _parsing = false;
+            }
+
+            // Ensure the limit holds for the parsed result as a whole.
+            if (_err == null && _maxParts >= 0)
+            {
+                int numParts = getParsedParts().size();
+                if (numParts > _maxParts)
+                    _err = new IllegalStateException(String.format("Form with too many parts [%d > %d]", numParts, _maxParts));
+            }
+        }
+
+        @Override
+        public boolean isWriteFilesWithFilenames()
+        {
+            // While parsing, this is called once for every new part, before any of
+            // the part content is read, so check if we can create a new part.
+            if (_parsing)
+            {
+                _numParts++;
+                if (_maxParts >= 0 && _numParts > _maxParts)
+                    throw new IllegalStateException(String.format("Form with too many parts [%d > %d]", _numParts, _maxParts));
+            }
+            return super.isWriteFilesWithFilenames();
+        }
     }
 }
